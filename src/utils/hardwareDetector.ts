@@ -450,3 +450,257 @@ pause
     pip: `python -m server --port ${port}`,
   };
 }
+
+// ===========================================================================
+// Full System Hardware Profile → Engine Requirements → Compatibility Score →
+// Recommendation pipeline.
+// Browsers expose limited hardware info (WebGL renderer string, CPU core
+// count, approximate RAM). GPU VRAM is estimated from the detected model
+// name since no web API can read true VRAM — the estimate feeds the scoring
+// below as a documented approximation, not a measurement.
+// ===========================================================================
+
+export interface SystemHardwareProfile {
+  gpu: GpuHardwareProfile;
+  cpu: {
+    cores: number;
+    summary: string;
+  };
+  memory: {
+    deviceMemoryGb: number | null; // navigator.deviceMemory (Chrome, approximate, capped at 8)
+    summary: string;
+  };
+  platform: {
+    os: string;
+    isMobileLike: boolean;
+    summary: string;
+  };
+  capturedAt: number;
+}
+
+/** Detect a full per-component hardware profile from the browser. */
+export function detectSystemHardwareProfile(): SystemHardwareProfile {
+  const gpu = detectGpuHardware();
+
+  const cores = navigator.hardwareConcurrency || 4;
+  const deviceMemoryGb = (navigator as any).deviceMemory ?? null;
+
+  let os = 'Unknown OS';
+  const ua = navigator.userAgent;
+  if (/Windows NT 10/.test(ua)) os = 'Windows 10/11';
+  else if (/Windows/.test(ua)) os = 'Windows (older)';
+  else if (/Mac OS X/.test(ua)) os = 'macOS';
+  else if (/CrOS/.test(ua)) os = 'ChromeOS';
+  else if (/Android/.test(ua)) os = 'Android';
+  else if (/Linux/.test(ua)) os = 'Linux';
+
+  const isMobileLike = /Android|iPhone|iPad|Mobile/i.test(ua);
+
+  return {
+    gpu,
+    cpu: {
+      cores,
+      summary: `${cores} logical core${cores === 1 ? '' : 's'}`,
+    },
+    memory: {
+      deviceMemoryGb,
+      summary: deviceMemoryGb ? `~${deviceMemoryGb}GB (browser-reported, conservative)` : 'Not exposed by this browser',
+    },
+    platform: {
+      os,
+      isMobileLike,
+      summary: `${os}${isMobileLike ? ' (mobile-class)' : ''}`,
+    },
+    capturedAt: Date.now(),
+  };
+}
+
+/** What an engine needs to run acceptably on this machine. */
+export interface EngineRequirement {
+  engineId: LocalTtsModelId;
+  minVramGb: number;        // below this: will not run
+  recommendedVramGb: number; // at/above: comfortable, full precision
+  minCpuCores: number;
+  cudaRequired: boolean;    // NVIDIA CUDA strictly required
+  appleSiliconOk: boolean;  // runs well on Apple Silicon unified memory
+  cpuOnlyOk: boolean;       // has a usable CPU inference path
+  notes: string;
+}
+
+export const ENGINE_REQUIREMENTS: Record<LocalTtsModelId, EngineRequirement> = {
+  fish_audio: {
+    engineId: 'fish_audio',
+    minVramGb: 6,
+    recommendedVramGb: 12,
+    minCpuCores: 4,
+    cudaRequired: false,
+    appleSiliconOk: true,
+    cpuOnlyOk: false,
+    notes: 'VQ-GAN autoregressive codec; benefits greatly from VRAM headroom.',
+  },
+  orpheus: {
+    engineId: 'orpheus',
+    minVramGb: 8,
+    recommendedVramGb: 16,
+    minCpuCores: 4,
+    cudaRequired: false,
+    appleSiliconOk: true,
+    cpuOnlyOk: false,
+    notes: '3B-parameter theatrical prosody model; heavy footprint.',
+  },
+  moss: {
+    engineId: 'moss',
+    minVramGb: 10,
+    recommendedVramGb: 16,
+    minCpuCores: 6,
+    cudaRequired: false,
+    appleSiliconOk: true,
+    cpuOnlyOk: false,
+    notes: 'Expressive multi-acent model with zero-shot matching; largest demand.',
+  },
+  chatterbox: {
+    engineId: 'chatterbox',
+    minVramGb: 4,
+    recommendedVramGb: 8,
+    minCpuCores: 2,
+    cudaRequired: false,
+    appleSiliconOk: true,
+    cpuOnlyOk: false,
+    notes: 'Fast conversational engine; efficient, good mid-range choice.',
+  },
+  piper: {
+    engineId: 'piper',
+    minVramGb: 0,
+    recommendedVramGb: 0,
+    minCpuCores: 2,
+    cudaRequired: false,
+    appleSiliconOk: true,
+    cpuOnlyOk: true,
+    notes: 'Lightweight neural synthesizer built for CPU inference.',
+  },
+  custom: {
+    engineId: 'custom',
+    minVramGb: 4,
+    recommendedVramGb: 8,
+    minCpuCores: 2,
+    cudaRequired: false,
+    appleSiliconOk: true,
+    cpuOnlyOk: false,
+    notes: 'Depends entirely on the server you point Narrativ at.',
+  },
+};
+
+export type EngineVerdict = 'ideal' | 'capable' | 'marginal' | 'insufficient';
+
+export interface EngineCompatibility {
+  engineId: LocalTtsModelId;
+  score: number; // 0-100
+  verdict: EngineVerdict;
+  recommendedQuantization: ModelQuantization;
+  reasons: string[]; // human-readable scoring breakdown
+}
+
+/** Score one engine against a full system hardware profile (0-100). */
+export function scoreEngineCompatibility(
+  profile: SystemHardwareProfile,
+  req: EngineRequirement
+): EngineCompatibility {
+  const reasons: string[] = [];
+  let score = 0;
+
+  const vram = profile.gpu.estimatedVramGb;
+  const isApple = profile.gpu.isAppleSilicon;
+  const isCuda = profile.gpu.isNvidiaCuda;
+  const isIntegrated = profile.gpu.vramTier === 'tier_c_budget';
+
+  // 1. GPU / VRAM capacity (max 50)
+  if (req.cpuOnlyOk) {
+    score += 50;
+    reasons.push('Runs entirely on CPU — no VRAM dependency (+50)');
+  } else if (vram >= req.recommendedVramGb) {
+    score += 50;
+    reasons.push(`VRAM ${vram}GB ≥ recommended ${req.recommendedVramGb}GB — full precision comfortable (+50)`);
+  } else if (vram >= req.minVramGb) {
+    const ratio = (vram - req.minVramGb) / Math.max(1, req.recommendedVramGb - req.minVramGb);
+    score += Math.round(25 + 20 * ratio);
+    reasons.push(`VRAM ${vram}GB meets minimum ${req.minVramGb}GB but below recommended ${req.recommendedVramGb}GB (+${Math.round(25 + 20 * ratio)})`);
+  } else if (isApple && req.appleSiliconOk) {
+    // Apple unified memory can exceed the discrete-GPU estimate
+    const unifiedBonus = profile.memory.deviceMemoryGb ? Math.min(20, profile.memory.deviceMemoryGb) : 15;
+    score += Math.min(30, unifiedBonus);
+    reasons.push(`Apple Silicon unified memory can substitute for low discrete VRAM estimate (+${Math.min(30, unifiedBonus)})`);
+  } else {
+    reasons.push(`Insufficient VRAM: ${vram}GB < minimum ${req.minVramGb}GB (+0)`);
+  }
+
+  // 2. Accelerator fit (max 25)
+  if (isCuda) {
+    score += 25;
+    reasons.push('NVIDIA CUDA available — fastest inference path (+25)');
+  } else if (isApple && req.appleSiliconOk) {
+    score += 20;
+    reasons.push('Apple Silicon MPS acceleration (+20)');
+  } else if (req.cpuOnlyOk) {
+    score += 18;
+    reasons.push('No GPU needed for this engine (+18)');
+  } else if (isIntegrated) {
+    reasons.push('Integrated/low-end GPU — expect slow or unusable inference (+0)');
+  } else {
+    score += 8;
+    reasons.push('Non-CUDA discrete GPU (ROCm/other) — partial support only (+8)');
+  }
+
+  // 3. CPU cores (max 15)
+  const coreScore = Math.min(15, Math.round((profile.cpu.cores / Math.max(1, req.minCpuCores)) * 7.5));
+  score += coreScore;
+  if (profile.cpu.cores >= req.minCpuCores) {
+    reasons.push(`${profile.cpu.cores} cores ≥ ${req.minCpuCores} required (+${coreScore})`);
+  } else {
+    reasons.push(`CPU may bottleneck: ${profile.cpu.cores} cores < ${req.minCpuCores} (+${coreScore})`);
+  }
+
+  // 4. System memory headroom (max 10)
+  const memGb = profile.memory.deviceMemoryGb;
+  if (memGb && memGb >= 8) {
+    score += 10;
+    reasons.push(`~${memGb}GB system RAM available (+10)`);
+  } else if (memGb) {
+    score += 5;
+    reasons.push(`~${memGb}GB system RAM — tight for model loading (+5)`);
+  } else {
+    score += 5;
+    reasons.push('System RAM not reported by browser (+5 assumed)');
+  }
+
+  if (profile.platform.isMobileLike) {
+    score = Math.min(score, 15);
+    reasons.push('Mobile-class device — local model hosting not practical (capped)');
+  }
+
+  // Quantization advice & verdict
+  let recommendedQuantization: ModelQuantization = profile.gpu.recommendedQuantization;
+  if (req.cpuOnlyOk) {
+    recommendedQuantization = 'cpu_onnx';
+  } else if (!req.cpuOnlyOk && vram >= req.recommendedVramGb) {
+    recommendedQuantization = 'fp16';
+  } else if (vram >= req.minVramGb) {
+    recommendedQuantization = 'int8';
+  } else {
+    recommendedQuantization = 'int4';
+  }
+
+  let verdict: EngineVerdict;
+  if (score >= 85) verdict = 'ideal';
+  else if (score >= 65) verdict = 'capable';
+  else if (score >= 45) verdict = 'marginal';
+  else verdict = 'insufficient';
+
+  return { engineId: req.engineId, score: Math.max(0, Math.min(100, score)), verdict, recommendedQuantization, reasons };
+}
+
+/** Rank all local engines by compatibility for this machine (best first). */
+export function rankEngineRecommendations(profile: SystemHardwareProfile): EngineCompatibility[] {
+  return (Object.keys(ENGINE_REQUIREMENTS) as LocalTtsModelId[])
+    .map((id) => scoreEngineCompatibility(profile, ENGINE_REQUIREMENTS[id]))
+    .sort((a, b) => b.score - a.score);
+}

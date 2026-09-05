@@ -28,6 +28,12 @@ export interface MultiVoiceConfig {
   characterRoles?: VoiceCastRole[];
 }
 
+export interface PronunciationEntry {
+  id: string;
+  word: string;          // as written in the manuscript, e.g. "Tarae"
+  pronunciation: string; // how it should be spoken, e.g. "tah-RYE"
+}
+
 export type SoundscapeType =
   | 'none'
   | 'rain'
@@ -66,12 +72,13 @@ export interface AudiobookProject {
   createdAt: number;
   updatedAt: number;
   voice: string;
-  voiceProvider: 'browser_neural' | 'gemini' | 'local_http';
+  voiceProvider: 'local_models' | 'browser_neural' | 'gemini' | 'local_http';
   emotion: EmotionPreset;
   pitch: number;
   rate: number;
   multiVoice?: MultiVoiceConfig;
   soundscape?: SoundscapeConfig;
+  pronunciations?: PronunciationEntry[];
   chapters: Chapter[];
   currentChapterIndex: number;
 }

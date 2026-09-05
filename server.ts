@@ -489,22 +489,28 @@ app.post('/api/tts/generate', async (req, res) => {
 
       if (localTtsRes && localTtsRes.ok) {
         const contentType = localTtsRes.headers.get('content-type') || '';
-        let dataUrl: string;
+        let audioBuffer: Buffer;
+        let mime = 'audio/wav';
 
         if (contentType.includes('application/json')) {
           const json = await localTtsRes.json();
+          let b64: string | undefined;
+          let jsonMime: string | undefined;
           if (json.audioDataUrl) {
-            dataUrl = json.audioDataUrl;
+            b64 = json.audioDataUrl.split(',')[1];
+            jsonMime = json.audioDataUrl.match(/^data:([^;]+)/)?.[1];
           } else if (json.audio_base64 || json.audio) {
-            dataUrl = `data:audio/wav;base64,${json.audio_base64 || json.audio}`;
-          } else {
+            b64 = json.audio_base64 || json.audio;
+          }
+          if (!b64) {
             throw new Error('Unexpected JSON format from local TTS server');
           }
+          audioBuffer = Buffer.from(b64, 'base64');
+          mime = jsonMime || 'audio/wav';
         } else {
           const arrayBuf = await localTtsRes.arrayBuffer();
-          const base64 = Buffer.from(arrayBuf).toString('base64');
-          const mime = contentType || 'audio/wav';
-          dataUrl = `data:${mime};base64,${base64}`;
+          audioBuffer = Buffer.from(arrayBuf);
+          mime = contentType || 'audio/wav';
         }
 
         const modelDisplayNames: Record<string, string> = {
@@ -516,15 +522,11 @@ app.post('/api/tts/generate', async (req, res) => {
           custom: 'Custom Local TTS',
         };
 
-        return res.json({
-          success: true,
-          audioDataUrl: dataUrl,
-          format: 'wav',
+        return sendAudio(res, audioBuffer, {
+          mime,
           duration: Math.max(3, Math.round(text.split(/\s+/).length / (2.5 * speed))),
-          voice,
-          emotion,
-          isLocal: true,
           source: `${modelDisplayNames[localTtsModelType] || 'Local TTS Engine'} [${quantization.toUpperCase()}]`,
+          isLocal: true,
         });
       }
     } catch (locErr: any) {
@@ -607,22 +609,15 @@ app.post('/api/tts/generate', async (req, res) => {
     // Convert PCM (24000Hz, 16bit mono) to standard WAV format
     const pcmBuffer = Buffer.from(base64Audio, 'base64');
     const wavBuffer = pcmToWav(pcmBuffer, 24000, 1, 16);
-    const wavBase64 = wavBuffer.toString('base64');
-    const dataUrl = `data:audio/wav;base64,${wavBase64}`;
 
     // Calculate approximate duration in seconds (dataSize / byteRate)
     const durationSeconds = pcmBuffer.length / (24000 * 2);
 
-    return res.json({
-      success: true,
-      audioDataUrl: dataUrl,
-      format: 'wav',
-      sampleRate: 24000,
+    return sendAudio(res, wavBuffer, {
+      mime: 'audio/wav',
       duration: durationSeconds,
-      voice: validVoice,
-      emotion,
-      isLocal: false,
       source: 'Cloud Hosted Gemini TTS',
+      isLocal: false,
     });
   } catch (err: any) {
     console.warn('Gemini TTS error handled:', err?.message || err);
@@ -699,8 +694,32 @@ function generateTimbrePreviewWav(voice: string, emotion: string): string {
   return `data:audio/wav;base64,${fullWav.toString('base64')}`;
 }
 
-// Fast In-Memory Cache for Voice Previews
-const previewCache = new Map<string, { audioDataUrl: string; duration: number }>();
+// Fast In-Memory Cache for Voice Previews (bounded — evicts oldest first)
+const MAX_PREVIEW_CACHE_ENTRIES = 40;
+const previewCache = new Map<string, { buffer: Buffer; mime: string; duration: number; meta: Record<string, string> }>();
+
+function cachePreview(key: string, buffer: Buffer, mime: string, duration: number, meta: Record<string, string> = {}) {
+  previewCache.set(key, { buffer, mime, duration, meta });
+  while (previewCache.size > MAX_PREVIEW_CACHE_ENTRIES) {
+    const oldest = previewCache.keys().next().value;
+    if (oldest === undefined) break;
+    previewCache.delete(oldest);
+  }
+}
+
+// Send raw audio bytes with metadata in X-Narrativ-* headers (avoids base64
+// data URLs, which roughly double payload size and break on long audio).
+function sendAudio(res: any, buffer: Buffer, meta: { mime: string; duration: number; source: string; isLocal: boolean; isFallback?: boolean; notice?: string }) {
+  return res
+    .set('Content-Type', meta.mime)
+    .set('Content-Length', String(buffer.length))
+    .set('X-Narrativ-Is-Local', String(meta.isLocal))
+    .set('X-Narrativ-Fallback', String(!!meta.isFallback))
+    .set('X-Narrativ-Source', meta.source)
+    .set('X-Narrativ-Duration', String(meta.duration))
+    .set('X-Narrativ-Notice', meta.notice || '')
+    .send(buffer);
+}
 
 // Voice Preview endpoint
 app.post('/api/tts/preview', async (req, res) => {
@@ -712,13 +731,13 @@ app.post('/api/tts/preview', async (req, res) => {
   const cacheKey = `${validVoice}_${emotion}`;
   if (previewCache.has(cacheKey)) {
     const cached = previewCache.get(cacheKey)!;
-    return res.json({
-      success: true,
-      audioDataUrl: cached.audioDataUrl,
+    return sendAudio(res, cached.buffer, {
+      mime: cached.mime,
       duration: cached.duration,
-      voice: validVoice,
-      emotion,
-      cached: true,
+      source: `Cached Gemini Preview (${validVoice})`,
+      isLocal: false,
+      isFallback: cached.meta.isFallback === 'true',
+      notice: cached.meta.notice,
     });
   }
 
@@ -739,14 +758,16 @@ app.post('/api/tts/preview', async (req, res) => {
   const ai = getGeminiClient();
   if (!ai) {
     const fallbackWav = generateTimbrePreviewWav(validVoice, emotion);
-    return res.json({
-      success: true,
-      audioDataUrl: fallbackWav,
+    const buffer = Buffer.from(fallbackWav.split(',')[1] || '', 'base64');
+    const mime = (fallbackWav.match(/^data:([^;]+)/)?.[1]) || 'audio/wav';
+    cachePreview(cacheKey, buffer, mime, 2.4, { isFallback: 'true', notice: 'API key not configured; played acoustic timbre preview.' });
+    return sendAudio(res, buffer, {
+      mime,
       duration: 2.4,
-      voice: validVoice,
-      emotion,
+      source: 'Acoustic Timbre Preview (No API Key)',
+      isLocal: true,
       isFallback: true,
-      fallbackNotice: 'API key not configured; played acoustic timbre preview.',
+      notice: 'API key not configured; played acoustic timbre preview.',
     });
   }
 
@@ -771,22 +792,15 @@ app.post('/api/tts/preview', async (req, res) => {
 
     const pcmBuffer = Buffer.from(base64Audio, 'base64');
     const wavBuffer = pcmToWav(pcmBuffer, 24000, 1, 16);
-    const wavBase64 = wavBuffer.toString('base64');
-    const dataUrl = `data:audio/wav;base64,${wavBase64}`;
     const durationSeconds = pcmBuffer.length / (24000 * 2);
 
-    previewCache.set(cacheKey, {
-      audioDataUrl: dataUrl,
-      duration: durationSeconds,
-    });
+    cachePreview(cacheKey, wavBuffer, 'audio/wav', durationSeconds, {});
 
-    return res.json({
-      success: true,
-      audioDataUrl: dataUrl,
+    return sendAudio(res, wavBuffer, {
+      mime: 'audio/wav',
       duration: durationSeconds,
-      voice: validVoice,
-      emotion,
-      cached: false,
+      source: `Gemini TTS Preview (${validVoice})`,
+      isLocal: false,
     });
   } catch (err: any) {
     console.warn('Gemini preview error, serving resilient fallback timbre:', err?.message || err);
@@ -802,23 +816,20 @@ app.post('/api/tts/preview', async (req, res) => {
 
     // Never fail: return generated acoustic vocal timbre preview
     const fallbackWav = generateTimbrePreviewWav(validVoice, emotion);
-    previewCache.set(cacheKey, {
-      audioDataUrl: fallbackWav,
-      duration: 2.4,
-    });
+    const buffer = Buffer.from(fallbackWav.split(',')[1] || '', 'base64');
+    const mime = (fallbackWav.match(/^data:([^;]+)/)?.[1]) || 'audio/wav';
+    const notice = isQuotaOrDemand
+      ? 'Gemini TTS model is currently experiencing high demand (503) or free-tier rate limits (429). Local acoustic timbre preview served.'
+      : 'Local acoustic preview served.';
+    cachePreview(cacheKey, buffer, mime, 2.4, { isFallback: 'true', notice });
 
-    return res.json({
-      success: true,
-      audioDataUrl: fallbackWav,
+    return sendAudio(res, buffer, {
+      mime,
       duration: 2.4,
-      voice: validVoice,
-      emotion,
-      cached: false,
+      source: 'Acoustic Timbre Preview (Fallback)',
+      isLocal: true,
       isFallback: true,
-      isQuotaLimited: isQuotaOrDemand,
-      fallbackNotice: isQuotaOrDemand
-        ? 'Gemini TTS model is currently experiencing high demand (503) or free-tier rate limits (429). Local acoustic timbre preview served.'
-        : 'Local acoustic preview served.',
+      notice,
     });
   }
 });

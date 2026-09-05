@@ -96,6 +96,22 @@ export function parseTextIntoChapters(rawText: string, defaultTitle = 'Untitled 
   return chapters;
 }
 
+// Apply a per-project pronunciation dictionary: whole-word, case-insensitive
+// replacement so narrators say names/acronyms the way the author intends.
+export function applyPronunciationMap(text: string, entries: Array<{ word: string; pronunciation: string }>): string {
+  if (!entries || entries.length === 0 || !text) return text;
+  let result = text;
+  for (const entry of entries) {
+    const word = (entry.word || '').trim();
+    const pron = (entry.pronunciation || '').trim();
+    if (!word || !pron) continue;
+    const escaped = word.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const wordBoundary = new RegExp(`\\b${escaped}\\b`, 'gi');
+    result = result.replace(wordBoundary, pron);
+  }
+  return result;
+}
+
 export function formatTime(seconds: number): string {
   if (isNaN(seconds) || seconds < 0) return '00:00';
   const mins = Math.floor(seconds / 60);

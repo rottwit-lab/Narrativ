@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { 
   Upload, 
   FileText, 
@@ -22,7 +22,13 @@ import {
   ShieldCheck,
   Shield,
   Cloud,
-  Lock
+  Lock,
+  Pencil,
+  ArrowUp,
+  ArrowDown,
+  Trash2,
+  Scissors,
+  Save
 } from 'lucide-react';
 import { 
   AudiobookProject, 
@@ -30,11 +36,15 @@ import {
   EmotionPreset, 
   LocalLLMConfig, 
   ScriptEnhancementMode,
-  MultiVoiceConfig 
+  MultiVoiceConfig,
+  PronunciationEntry
 } from '../types';
-import { parseTextIntoChapters, getEmotionGuidance } from '../utils/textParser';
-import { saveProjectOffline, saveAudioBlobOffline } from '../utils/storage';
+import { parseTextIntoChapters, getEmotionGuidance, applyPronunciationMap } from '../utils/textParser';
+import { saveProjectOffline, saveAudioBlobOffline, getDraftOffline, saveDraftOffline } from '../utils/storage';
+import { splitTextIntoChunks, parseTtsResponse, mergeAudioBlobs } from '../utils/audioUtils';
+import { tryLocalTtsDirect } from '../utils/localEngineProbe';
 import { MultiVoiceCastingCard } from './MultiVoiceCastingCard';
+import { PronunciationDictionaryCard } from './PronunciationDictionaryCard';
 import { BatchSynthesisModal } from './BatchSynthesisModal';
 import { SoundscapeMixer } from './SoundscapeMixer';
 import { ReadAlongTeleprompter } from './ReadAlongTeleprompter';
@@ -93,9 +103,10 @@ export const AudiobookCreatorView: React.FC<AudiobookCreatorViewProps> = ({
   const [authorName, setAuthorName] = useState('Narrator Studio');
   const [rawText, setRawText] = useState('');
   const [selectedVoice, setSelectedVoice] = useState('Puck');
-  const [voiceProvider, setVoiceProvider] = useState<'local_models' | 'browser_neural' | 'gemini'>('local_models');
+  const [voiceProvider, setVoiceProvider] = useState<'local_models' | 'gemini'>('local_models');
   const [browserVoices, setBrowserVoices] = useState<SpeechSynthesisVoice[]>([]);
   const [selectedBrowserVoice, setSelectedBrowserVoice] = useState<string>('');
+  const [pronunciations, setPronunciations] = useState<PronunciationEntry[]>(currentProject?.pronunciations || []);
   const [emotion, setEmotion] = useState<EmotionPreset>('narrative');
   const [pitch, setPitch] = useState(1.0);
   const [rate, setRate] = useState(1.0);
@@ -126,6 +137,85 @@ export const AudiobookCreatorView: React.FC<AudiobookCreatorViewProps> = ({
     }
   }, [currentProject?.id]);
 
+  // ---- Manuscript draft autosave & restore (never lose pasted text) ----
+  const draftRestoreDone = useRef(false);
+  useEffect(() => {
+    if (draftRestoreDone.current) return;
+    draftRestoreDone.current = true;
+    if (currentProject) return;
+    getDraftOffline()
+      .then((draft) => {
+        if (!draft) return;
+        setBookTitle(draft.bookTitle);
+        setAuthorName(draft.authorName);
+        setRawText(draft.rawText);
+        if (draft.selectedVoice) setSelectedVoice(draft.selectedVoice);
+        if (draft.voiceProvider === 'gemini') setVoiceProvider('gemini');
+        if (draft.emotion) setEmotion(draft.emotion as EmotionPreset);
+        if (typeof draft.pitch === 'number') setPitch(draft.pitch);
+        if (typeof draft.rate === 'number') setRate(draft.rate);
+        if (draft.scriptMode) setScriptMode(draft.scriptMode as ScriptEnhancementMode);
+        setPronunciations(draft.pronunciations || []);
+        if (draft.project && Array.isArray(draft.project.chapters) && draft.project.chapters.length > 0) {
+          setCurrentProject({
+            ...draft.project,
+            chapters: draft.project.chapters.map((ch: any) => ({
+              ...ch,
+              audioBlob: undefined,
+              audioBlobUrl: undefined,
+              status: ch.status === 'ready' || ch.status === 'error' ? 'idle' : ch.status,
+            })),
+          });
+          setStatusMessage('Draft restored — your unsaved manuscript was recovered.');
+        } else if (draft.rawText) {
+          setStatusMessage('Draft restored into the manuscript editor.');
+        }
+      })
+      .catch(() => {});
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Debounced autosave of the working draft (IndexedDB)
+  useEffect(() => {
+    const t = setTimeout(() => {
+      saveDraftOffline({
+        savedAt: Date.now(),
+        bookTitle,
+        authorName,
+        rawText,
+        selectedVoice,
+        voiceProvider,
+        emotion,
+        pitch,
+        rate,
+        scriptMode,
+        pronunciations,
+        project: currentProject
+          ? {
+              ...currentProject,
+              pronunciations,
+              chapters: currentProject.chapters.map((ch) => ({
+                ...ch,
+                audioBlob: undefined,
+                audioBlobUrl: undefined,
+              })),
+            }
+          : null,
+      }).catch(() => {});
+    }, 1200);
+    return () => clearTimeout(t);
+  }, [bookTitle, authorName, rawText, selectedVoice, voiceProvider, emotion, pitch, rate, scriptMode, pronunciations, currentProject]);
+
+  // Pronunciation dictionary changes persist onto the project
+  const handlePronunciationChange = (updated: PronunciationEntry[]) => {
+    setPronunciations(updated);
+    if (currentProject) {
+      const updatedProj = { ...currentProject, pronunciations: updated, updatedAt: Date.now() };
+      setCurrentProject(updatedProj);
+      saveProjectOffline(updatedProj);
+    }
+  };
+
   const handleMultiVoiceChange = (updated: MultiVoiceConfig) => {
     setMultiVoiceConfig(updated);
     if (currentProject) {
@@ -154,7 +244,7 @@ export const AudiobookCreatorView: React.FC<AudiobookCreatorViewProps> = ({
 
   // Voice Preview Handler
   const handlePreviewVoice = async (overrideVoice?: string) => {
-    const voiceToTest = overrideVoice || (voiceProvider === 'gemini' ? selectedVoice : selectedBrowserVoice);
+    const voiceToTest = overrideVoice || selectedVoice;
 
     // If currently previewing this voice, toggle off
     if (isPreviewing && (previewingVoice === voiceToTest || !overrideVoice)) {
@@ -182,27 +272,8 @@ export const AudiobookCreatorView: React.FC<AudiobookCreatorViewProps> = ({
     setIsPreviewing(true);
     setPreviewingVoice(voiceToTest);
 
-    if (voiceProvider === 'browser_neural') {
-      // Offline Windows Speech Synthesis
-      const testText = `Welcome to Narrativ. Testing offline voice ${selectedBrowserVoice || 'default'} in a ${emotion} tone.`;
-      const utterance = new SpeechSynthesisUtterance(testText);
-      const voiceObj = browserVoices.find((v) => v.name === selectedBrowserVoice);
-      if (voiceObj) utterance.voice = voiceObj;
-      utterance.pitch = pitch;
-      utterance.rate = rate;
-
-      utterance.onend = () => {
-        setIsPreviewing(false);
-        setPreviewingVoice(null);
-      };
-      utterance.onerror = () => {
-        setIsPreviewing(false);
-        setPreviewingVoice(null);
-      };
-
-      window.speechSynthesis.speak(utterance);
-    } else {
-      // Gemini Expressive Studio Voice Preview via /api/tts/preview
+    {
+      // Voice preview via /api/tts/preview (binary WAV + metadata headers)
       try {
         const response = await fetch('/api/tts/preview', {
           method: 'POST',
@@ -213,27 +284,21 @@ export const AudiobookCreatorView: React.FC<AudiobookCreatorViewProps> = ({
           }),
         });
 
-        const data = await response.json();
-        if (!response.ok || !data.success) {
-          throw new Error(data.error || 'Preview failed');
-        }
+        const parsed = await parseTtsResponse(response);
 
-        if (data.isQuotaLimited || data.isFallback) {
-          setStatusMessage('Gemini TTS is at free-tier quota (limit 10/day) or high demand (503). Playing preview with acoustic timbre & speech fallback.');
+        if (parsed.isFallback) {
+          setStatusMessage(parsed.notice || 'Cloud TTS unavailable — playing acoustic timbre preview.');
         } else {
           setStatusMessage(`Previewing ${voiceToTest} (${emotion})...`);
         }
 
-        const audio = new Audio(data.audioDataUrl);
+        const audio = new Audio(URL.createObjectURL(parsed.blob));
         setPreviewAudioObj(audio);
 
         audio.onended = () => {
           setIsPreviewing(false);
           setPreviewingVoice(null);
           setPreviewAudioObj(null);
-          if (data.isFallback) {
-            playOfflineVoiceSample(voiceToTest, emotion);
-          }
         };
         audio.onerror = () => {
           setIsPreviewing(false);
@@ -374,17 +439,131 @@ export const AudiobookCreatorView: React.FC<AudiobookCreatorViewProps> = ({
       author,
       createdAt: Date.now(),
       updatedAt: Date.now(),
-      voice: voiceProvider === 'gemini' ? selectedVoice : selectedBrowserVoice,
+      voice: selectedVoice,
       voiceProvider,
       emotion,
       pitch,
       rate,
+      multiVoice: multiVoiceConfig,
+      pronunciations,
       chapters,
       currentChapterIndex: 0,
     };
 
     setCurrentProject(newProj);
     setSelectedChapterTab(0);
+  };
+
+  // ---- Chapter editor: rename / merge / split / reorder / delete ----
+  const persistChapters = (chapters: Chapter[], selectedIdx?: number) => {
+    if (!currentProject) return;
+    const clampedIdx = Math.min(Math.max(selectedIdx ?? selectedChapterTab, 0), chapters.length - 1);
+    setSelectedChapterTab(clampedIdx);
+    const updatedProj: AudiobookProject = {
+      ...currentProject,
+      chapters,
+      currentChapterIndex: clampedIdx,
+      updatedAt: Date.now(),
+    };
+    setCurrentProject(updatedProj);
+    saveProjectOffline(updatedProj);
+  };
+
+  const handleRenameChapter = () => {
+    if (!currentProject) return;
+    const ch = currentProject.chapters[selectedChapterTab];
+    if (!ch) return;
+    const name = prompt('Chapter title:', ch.title);
+    if (!name || !name.trim() || !currentProject) return;
+    const chapters = [...currentProject.chapters];
+    chapters[selectedChapterTab] = { ...ch, title: name.trim() };
+    persistChapters(chapters);
+  };
+
+  const handleMergeChapterUp = () => {
+    if (!currentProject || selectedChapterTab === 0) return;
+    const chapters = [...currentProject.chapters];
+    const idx = selectedChapterTab;
+    const above = chapters[idx - 1];
+    const below = chapters[idx];
+    chapters[idx - 1] = {
+      ...above,
+      title: `${above.title} & ${below.title}`,
+      originalText: `${above.originalText}\n\n${below.originalText}`,
+      narratedScript: `${above.narratedScript || above.originalText}\n\n${below.narratedScript || below.originalText}`,
+    };
+    chapters.splice(idx, 1);
+    persistChapters(chapters, idx - 1);
+    setStatusMessage(`Merged "${below.title}" into "${above.title}".`);
+  };
+
+  const scriptTextareaRef = useRef<HTMLTextAreaElement>(null);
+  const handleSplitChapter = () => {
+    if (!currentProject) return;
+    const ch = currentProject.chapters[selectedChapterTab];
+    if (!ch) return;
+    const text = ch.narratedScript || ch.originalText;
+    const cursor = scriptTextareaRef.current?.selectionStart ?? Math.floor(text.length / 2);
+
+    // Nearest sentence boundary at or before the cursor
+    let cut = Math.max(text.lastIndexOf('.', cursor), text.lastIndexOf('!', cursor), text.lastIndexOf('?', cursor));
+    if (cut <= 0 || cut >= text.length - 1) cut = text.lastIndexOf(' ', cursor);
+    if (cut <= 0 || cut >= text.length - 1) {
+      setStatusMessage('Place the text cursor where the chapter should split, then click Split again.');
+      return;
+    }
+
+    const firstText = text.slice(0, cut + 1).trim();
+    const secondText = text.slice(cut + 1).trim();
+    if (!firstText || !secondText) return;
+
+    const chapters = [...currentProject.chapters];
+    const idx = selectedChapterTab;
+    chapters[idx] = {
+      ...ch,
+      originalText: firstText,
+      narratedScript: firstText,
+      status: 'idle',
+      audioBlob: undefined,
+      audioBlobUrl: undefined,
+      errorMessage: undefined,
+    };
+    chapters.splice(idx + 1, 0, {
+      ...ch,
+      id: `ch_${Date.now()}_split`,
+      title: `${ch.title} (Part 2)`,
+      originalText: secondText,
+      narratedScript: secondText,
+      status: 'idle',
+      audioBlob: undefined,
+      audioBlobUrl: undefined,
+      errorMessage: undefined,
+    });
+    persistChapters(chapters, idx + 1);
+    setStatusMessage(`Chapter split — new chapter "${ch.title} (Part 2)" created at the cursor.`);
+  };
+
+  const handleMoveChapter = (dir: -1 | 1) => {
+    if (!currentProject) return;
+    const idx = selectedChapterTab;
+    const target = idx + dir;
+    if (target < 0 || target >= currentProject.chapters.length) return;
+    const chapters = [...currentProject.chapters];
+    [chapters[idx], chapters[target]] = [chapters[target], chapters[idx]];
+    persistChapters(chapters, target);
+  };
+
+  const handleDeleteChapter = () => {
+    if (!currentProject) return;
+    if (currentProject.chapters.length <= 1) {
+      setStatusMessage('A project needs at least one chapter.');
+      return;
+    }
+    const ch = currentProject.chapters[selectedChapterTab];
+    if (!confirm(`Delete chapter "${ch?.title}"? Its audio will also be removed.`)) return;
+    const chapters = currentProject.chapters.filter((_, i) => i !== selectedChapterTab);
+    persistChapters(chapters, Math.max(0, selectedChapterTab - 1));
+    setStatusMessage(`Chapter "${ch?.title}" deleted.`);
   };
 
   // Enhance script with Local LLM (Privacy-First) or Cloud Gemini Fallback
@@ -466,106 +645,145 @@ export const AudiobookCreatorView: React.FC<AudiobookCreatorViewProps> = ({
     if (!targetChapter) return;
 
     setIsSynthesizing(true);
+    setSynthesisProgress(0);
     setStatusMessage(`Synthesizing Chapter ${chapterIndex + 1}: ${targetChapter.title}...`);
 
     try {
-      // 1. Check Strict Local Air-Gapped Mode
+      // Strict Local Air-Gapped Mode blocks cloud synthesis entirely
       if (localConfig.privacyMode === 'strict_local' && voiceProvider === 'gemini') {
-        setStatusMessage('Strict Local Privacy Mode is active. Cloud synthesis blocked; using Windows Offline Voice.');
+        setStatusMessage('Strict Local Privacy Mode is active. Cloud synthesis blocked; using Browser Speech fallback.');
         await synthesizeBrowserSpeech(targetChapter, chapterIndex);
         return;
       }
 
-      if (voiceProvider === 'browser_neural') {
-        // 100% Offline browser speech synthesis (Windows Natural Voice)
-        await synthesizeBrowserSpeech(targetChapter, chapterIndex);
-      } else {
-        // Local Neural Models (Chatterbox, Orpheus, Moss, Fish Audio) or Hosted Gemini TTS
-        const scriptToSpeak = targetChapter.narratedScript || targetChapter.originalText;
-        const guidance = getEmotionGuidance(emotion);
-        const activeModelKey = localConfig.activeTtsEngine || 'fish_audio';
-        const engineConfig = localConfig.ttsConfigs?.[activeModelKey];
+      const guidance = getEmotionGuidance(emotion);
+      const activeModelKey = localConfig.activeTtsEngine || 'fish_audio';
+      const engineConfig = localConfig.ttsConfigs?.[activeModelKey];
+      const isLocalModelActive = voiceProvider === 'local_models';
 
-        const isLocalModelActive = voiceProvider === 'local_models';
+      // Apply the pronunciation dictionary, then split into sentence-aligned
+      // chunks so long chapters never exceed TTS input limits.
+      const scriptToSpeak = targetChapter.narratedScript || targetChapter.originalText;
+      const spokenText = applyPronunciationMap(scriptToSpeak, pronunciations);
+      const chunks = splitTextIntoChunks(spokenText, 1400);
+      const audioChunks: Blob[] = [];
+      let firstMeta: { source: string; isLocal: boolean; duration: number } | null = null;
+      let usedClientDirect = false;
 
-        const response = await fetch('/api/tts/generate', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            text: scriptToSpeak,
+      for (let i = 0; i < chunks.length; i++) {
+        setStatusMessage(
+          chunks.length > 1
+            ? `Synthesizing "${targetChapter.title}" — chunk ${i + 1}/${chunks.length}...`
+            : `Synthesizing ${targetChapter.title}...`
+        );
+
+        // For local engines, first try a DIRECT browser connection to the
+        // visitor's own machine — a server-side proxy can never reach it.
+        let chunkBlob: Blob | null = null;
+        if (isLocalModelActive && i === 0) {
+          chunkBlob = await tryLocalTtsDirect(activeModelKey, engineConfig?.endpoint || 'http://localhost:8080', {
+            model: activeModelKey,
+            text: chunks[i],
             voice: selectedVoice,
-            emotion,
-            pacingPrompt: guidance.desc,
-            multiVoice: multiVoiceConfig.enabled ? multiVoiceConfig : undefined,
-            localTtsEndpoint: isLocalModelActive
-              ? (engineConfig?.endpoint || localConfig.localTtsEndpoint || 'http://localhost:8080')
-              : (localConfig.localTtsConnected ? localConfig.localTtsEndpoint : undefined),
-            localTtsModel: activeModelKey,
-            localTtsModelType: activeModelKey,
             temperature: engineConfig?.temperature ?? 0.7,
             topP: engineConfig?.topP ?? 0.9,
             speed: engineConfig?.speed ?? rate,
-            quantization: engineConfig?.quantization ?? 'fp16',
             sampleRate: engineConfig?.sampleRate ?? 32000,
+            quantization: engineConfig?.quantization ?? 'fp16',
             referenceAudioPrompt: engineConfig?.referenceAudioPrompt,
-            privacyMode: localConfig.privacyMode || 'smart_fallback',
-            allowCloudFallback: voiceProvider === 'gemini' 
-              ? true 
-              : (localConfig.privacyMode === 'strict_local' ? false : (localConfig.allowCloudFallback ?? true)),
-          }),
-        });
-
-        const data = await response.json();
-
-        if (!response.ok || data.quotaExceeded || !data.success) {
-          console.warn('TTS synthesis notice:', data.error);
-          setStatusMessage(
-            data.isHighDemand || data.quotaExceeded
-              ? 'Cloud TTS is at quota/busy. Falling back to Windows Offline Voice...'
-              : `Local server at ${engineConfig?.endpoint || 'localhost'} offline. Falling back to Windows Offline Voice...`
-          );
-          await synthesizeBrowserSpeech(targetChapter, chapterIndex);
-          return;
+          });
+          if (chunkBlob) usedClientDirect = true;
         }
 
-        // Convert dataUrl to blob
-        const res = await fetch(data.audioDataUrl);
-        const blob = await res.blob();
-        const blobUrl = URL.createObjectURL(blob);
+        if (!chunkBlob) {
+          const response = await fetch('/api/tts/generate', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              text: chunks[i],
+              voice: selectedVoice,
+              emotion,
+              pacingPrompt: guidance.desc,
+              multiVoice: multiVoiceConfig.enabled ? multiVoiceConfig : undefined,
+              localTtsEndpoint: isLocalModelActive
+                ? (engineConfig?.endpoint || localConfig.localTtsEndpoint || 'http://localhost:8080')
+                : (localConfig.localTtsConnected ? localConfig.localTtsEndpoint : undefined),
+              localTtsModel: activeModelKey,
+              localTtsModelType: activeModelKey,
+              temperature: engineConfig?.temperature ?? 0.7,
+              topP: engineConfig?.topP ?? 0.9,
+              speed: engineConfig?.speed ?? rate,
+              quantization: engineConfig?.quantization ?? 'fp16',
+              sampleRate: engineConfig?.sampleRate ?? 32000,
+              referenceAudioPrompt: engineConfig?.referenceAudioPrompt,
+              privacyMode: localConfig.privacyMode || 'smart_fallback',
+              allowCloudFallback: voiceProvider === 'gemini'
+                ? true
+                : (localConfig.privacyMode === 'strict_local' ? false : (localConfig.allowCloudFallback ?? true)),
+            }),
+          });
 
-        // Update chapter with privacy and source metadata
-        const isLocalTts = data.isLocal || false;
-        const updatedChapters = [...currentProject.chapters];
-        updatedChapters[chapterIndex] = {
-          ...updatedChapters[chapterIndex],
-          audioBlob: blob,
-          audioBlobUrl: blobUrl,
-          duration: data.duration || 60,
-          status: 'ready',
-          speechSource: data.source || (isLocalTts ? 'Local TTS Engine' : 'Cloud Hosted Gemini TTS'),
-          privacyLevel: isLocalTts ? '100% On-Device' : 'Cloud Fallback',
-        };
+          const parsed = await parseTtsResponse(response);
+          if (i === 0) firstMeta = { source: parsed.source, isLocal: parsed.isLocal, duration: parsed.duration };
+          if (parsed.notice) setStatusMessage(parsed.notice);
+          chunkBlob = parsed.blob;
+        }
 
-        const updatedProj = {
-          ...currentProject,
-          chapters: updatedChapters,
-          updatedAt: Date.now(),
-        };
-
-        setCurrentProject(updatedProj);
-        await saveProjectOffline(updatedProj);
-        await saveAudioBlobOffline(targetChapter.id, blob);
-
-        setStatusMessage(
-          `Audio synthesized for ${targetChapter.title} (${isLocalTts ? '100% Private Local' : 'Cloud Hosted Gemini'})!`
-        );
-        onPlayChapter(chapterIndex);
+        if (!chunkBlob) throw new Error('TTS engine returned no audio for a chunk.');
+        audioChunks.push(chunkBlob);
+        setSynthesisProgress(Math.round(((i + 1) / chunks.length) * 100));
       }
+
+      // Merge chunk WAVs into one continuous track
+      const { blob: mergedBlob, duration: mergedDuration } = await mergeAudioBlobs(audioChunks);
+      const blobUrl = URL.createObjectURL(mergedBlob);
+
+      const isLocalTts = usedClientDirect || firstMeta?.isLocal || false;
+      const source = usedClientDirect
+        ? `${engineConfig?.name || 'Local TTS Engine'} (Direct On-Device)`
+        : (firstMeta?.source || (isLocalTts ? 'Local TTS Engine' : 'Cloud Hosted Gemini TTS'));
+
+      const updatedChapters = [...currentProject.chapters];
+      updatedChapters[chapterIndex] = {
+        ...updatedChapters[chapterIndex],
+        audioBlob: mergedBlob,
+        audioBlobUrl: blobUrl,
+        duration: mergedDuration || firstMeta?.duration || 60,
+        status: 'ready',
+        speechSource: source,
+        privacyLevel: isLocalTts ? '100% On-Device' : 'Cloud Fallback',
+      };
+
+      const updatedProj = {
+        ...currentProject,
+        pronunciations,
+        chapters: updatedChapters,
+        updatedAt: Date.now(),
+      };
+
+      setCurrentProject(updatedProj);
+      await saveProjectOffline(updatedProj);
+      await saveAudioBlobOffline(targetChapter.id, mergedBlob);
+
+      setStatusMessage(
+        `Audio synthesized for ${targetChapter.title} — ${audioChunks.length} chunk${audioChunks.length === 1 ? '' : 's'}, ${isLocalTts ? '100% Private Local' : 'Cloud Hosted Gemini'}!`
+      );
+      onPlayChapter(chapterIndex);
     } catch (err: any) {
-      console.error(err);
+      console.warn('TTS synthesis notice:', err?.message || err);
+      if (err?.fallbackAvailable) {
+        setStatusMessage('Cloud TTS unavailable (quota/busy). Falling back to Browser Speech...');
+        try {
+          await synthesizeBrowserSpeech(targetChapter, chapterIndex);
+        } catch (e: any) {
+          setStatusMessage(`Synthesis failed: ${e.message}`);
+        }
+        return;
+      }
       setStatusMessage(`Synthesis failed: ${err.message}`);
     } finally {
       setIsSynthesizing(false);
+      setSynthesisProgress(0);
     }
   };
 
@@ -833,6 +1051,87 @@ export const AudiobookCreatorView: React.FC<AudiobookCreatorViewProps> = ({
                 ))}
               </div>
 
+              {/* Chapter Editor: rename / reorder / merge / split / delete */}
+              {currentProject.chapters.length > 0 && (
+                <div className="flex items-center justify-between flex-wrap gap-1.5">
+                  <div className="flex items-center gap-1.5">
+                    <button
+                      type="button"
+                      onClick={handleRenameChapter}
+                      className="px-2 py-1 rounded-lg bg-neutral-950 border border-neutral-800 hover:border-neutral-600 text-neutral-300 hover:text-white text-[11px] flex items-center space-x-1 transition-colors"
+                      title="Rename this chapter"
+                    >
+                      <Pencil className="w-3 h-3 text-lime-400" />
+                      <span>Rename</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => handleMoveChapter(-1)}
+                      disabled={selectedChapterTab === 0}
+                      className="p-1.5 rounded-lg bg-neutral-950 border border-neutral-800 hover:border-neutral-600 disabled:opacity-30 text-neutral-400 hover:text-white transition-colors"
+                      title="Move chapter up"
+                    >
+                      <ArrowUp className="w-3 h-3" />
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => handleMoveChapter(1)}
+                      disabled={selectedChapterTab >= currentProject.chapters.length - 1}
+                      className="p-1.5 rounded-lg bg-neutral-950 border border-neutral-800 hover:border-neutral-600 disabled:opacity-30 text-neutral-400 hover:text-white transition-colors"
+                      title="Move chapter down"
+                    >
+                      <ArrowDown className="w-3 h-3" />
+                    </button>
+                  </div>
+                  <div className="flex items-center gap-1.5">
+                    <button
+                      type="button"
+                      onClick={handleMergeChapterUp}
+                      disabled={selectedChapterTab === 0}
+                      className="px-2 py-1 rounded-lg bg-neutral-950 border border-neutral-800 hover:border-neutral-600 disabled:opacity-30 text-neutral-300 hover:text-white text-[11px] flex items-center space-x-1 transition-colors"
+                      title="Merge this chapter into the previous one"
+                    >
+                      <Layers className="w-3 h-3 text-lime-400" />
+                      <span>Merge Up</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={handleSplitChapter}
+                      className="px-2 py-1 rounded-lg bg-neutral-950 border border-neutral-800 hover:border-neutral-600 text-neutral-300 hover:text-white text-[11px] flex items-center space-x-1 transition-colors"
+                      title="Split this chapter at the text cursor into two chapters"
+                    >
+                      <Scissors className="w-3 h-3 text-lime-400" />
+                      <span>Split at Cursor</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={handleDeleteChapter}
+                      className="px-2 py-1 rounded-lg bg-neutral-950 border border-neutral-800 hover:border-red-500/50 text-neutral-400 hover:text-red-400 text-[11px] flex items-center space-x-1 transition-colors"
+                      title="Delete this chapter"
+                    >
+                      <Trash2 className="w-3 h-3" />
+                      <span>Delete</span>
+                    </button>
+                  </div>
+                </div>
+              )}
+
+              {/* Synthesis progress */}
+              {isSynthesizing && (
+                <div className="space-y-1.5">
+                  <div className="w-full h-1.5 bg-neutral-800 rounded-full overflow-hidden">
+                    <div
+                      className="h-full bg-lime-400 rounded-full transition-all duration-300"
+                      style={{ width: `${synthesisProgress}%` }}
+                    />
+                  </div>
+                  <div className="text-[10px] text-neutral-500 font-mono flex items-center space-x-1.5">
+                    <Loader2 className="w-3 h-3 animate-spin text-lime-400" />
+                    <span>{synthesisProgress}%</span>
+                  </div>
+                </div>
+              )}
+
               {/* Active Chapter Script & Controls */}
               {currentProject.chapters[selectedChapterTab] && (
                 <div className="space-y-3">
@@ -890,6 +1189,7 @@ export const AudiobookCreatorView: React.FC<AudiobookCreatorViewProps> = ({
                     />
                   ) : (
                     <textarea
+                      ref={scriptTextareaRef}
                       value={currentProject.chapters[selectedChapterTab].narratedScript}
                       onChange={(e) => {
                         const updated = [...currentProject.chapters];
@@ -999,7 +1299,7 @@ export const AudiobookCreatorView: React.FC<AudiobookCreatorViewProps> = ({
                 <span className="truncate text-[11px]">
                   {isPreviewing 
                     ? `Auditioning ${previewingVoice} • Style: ${emotion}` 
-                    : `Active Voice: ${voiceProvider === 'gemini' ? selectedVoice : (selectedBrowserVoice || 'Default')} • ${emotion}`}
+                    : `Active Voice: ${selectedVoice} • ${emotion}`}
                 </span>
               </div>
 
@@ -1022,9 +1322,9 @@ export const AudiobookCreatorView: React.FC<AudiobookCreatorViewProps> = ({
               </button>
             </div>
 
-            {/* 3-Way Voice Engine Selector: Local Models vs Windows Voice vs Cloud Gemini */}
+            {/* Voice Engine Selector: Local Models vs Cloud Gemini */}
             <div className="space-y-2">
-              <div className="grid grid-cols-3 gap-1.5 bg-neutral-950 p-1 rounded-xl border border-neutral-800 text-[11px]">
+              <div className="grid grid-cols-2 gap-1.5 bg-neutral-950 p-1 rounded-xl border border-neutral-800 text-[11px]">
                 <button
                   type="button"
                   onClick={() => setVoiceProvider('local_models')}
@@ -1036,18 +1336,6 @@ export const AudiobookCreatorView: React.FC<AudiobookCreatorViewProps> = ({
                 >
                   <Cpu className="w-3.5 h-3.5 text-lime-400" />
                   <span>Local Models</span>
-                </button>
-                <button
-                  type="button"
-                  onClick={() => setVoiceProvider('browser_neural')}
-                  className={`py-1.5 px-2 rounded-lg font-medium transition-all flex items-center justify-center space-x-1.5 ${
-                    voiceProvider === 'browser_neural'
-                      ? 'bg-neutral-800 text-lime-400 font-bold shadow-xs'
-                      : 'text-neutral-400 hover:text-neutral-200'
-                  }`}
-                >
-                  <ShieldCheck className="w-3.5 h-3.5 text-emerald-400" />
-                  <span>Windows Voice</span>
                 </button>
                 <button
                   type="button"
@@ -1073,8 +1361,6 @@ export const AudiobookCreatorView: React.FC<AudiobookCreatorViewProps> = ({
               <div className={`px-3 py-1.5 rounded-lg border text-[11px] flex items-center justify-between ${
                 voiceProvider === 'local_models'
                   ? 'bg-lime-950/30 border-lime-500/30 text-lime-300'
-                  : voiceProvider === 'browser_neural'
-                  ? 'bg-emerald-950/30 border-emerald-500/30 text-emerald-300'
                   : 'bg-neutral-950 border-neutral-800 text-neutral-300'
               }`}>
                 <div className="flex items-center space-x-1.5 truncate">
@@ -1082,13 +1368,11 @@ export const AudiobookCreatorView: React.FC<AudiobookCreatorViewProps> = ({
                     <>
                       <Cpu className="w-3.5 h-3.5 text-lime-400 flex-shrink-0" />
                       <span className="truncate">
-                        On-Device Neural Engine: <strong className="text-white">{localConfig.activeTtsEngine ? localConfig.activeTtsEngine.replace('_', ' ') : 'Fish Audio'}</strong> ({localConfig.detectedGpu?.renderer.split(' ')[0] || 'GPU'} Tuned)
+                        On-Device Neural Engine: <strong className="text-white">{localConfig.activeTtsEngine ? localConfig.activeTtsEngine.replace('_', ' ') : 'Fish Audio'}</strong>
+                        {localConfig.ttsConfigs?.[localConfig.activeTtsEngine || 'fish_audio']?.isConnected
+                          ? ' (Live on your machine)'
+                          : ' (not detected on this machine — runs when installed locally)'}
                       </span>
-                    </>
-                  ) : voiceProvider === 'browser_neural' ? (
-                    <>
-                      <ShieldCheck className="w-3.5 h-3.5 text-emerald-400 flex-shrink-0" />
-                      <span>Windows SAPI Offline (Zero Data Leaves Your PC)</span>
                     </>
                   ) : (
                     <>
@@ -1237,49 +1521,11 @@ export const AudiobookCreatorView: React.FC<AudiobookCreatorViewProps> = ({
                 </div>
               </div>
             ) : (
-              /* Offline Windows Browser Speech Voices */
-              <div className="space-y-2">
-                <div className="flex items-center justify-between">
-                  <label className="text-[11px] text-neutral-400 font-medium block">
-                    Windows Installed Voices ({browserVoices.length} detected)
-                  </label>
-                  <button
-                    type="button"
-                    onClick={() => handlePreviewVoice()}
-                    className="text-[10px] text-lime-400 hover:underline flex items-center space-x-1"
-                  >
-                    <Play className="w-2.5 h-2.5 fill-current" />
-                    <span>Test Voice</span>
-                  </button>
-                </div>
-                <div className="flex items-center space-x-2">
-                  <select
-                    value={selectedBrowserVoice}
-                    onChange={(e) => setSelectedBrowserVoice(e.target.value)}
-                    className="flex-1 bg-neutral-950 border border-neutral-800 rounded-xl px-3 py-2 text-neutral-200 text-xs focus:outline-none focus:border-lime-500/50"
-                  >
-                    {browserVoices.map((voice) => (
-                      <option key={voice.name} value={voice.name}>
-                        {voice.name} ({voice.lang})
-                      </option>
-                    ))}
-                  </select>
-                  <button
-                    type="button"
-                    onClick={() => handlePreviewVoice()}
-                    className={`p-2 rounded-xl border text-xs font-medium transition-all ${
-                      isPreviewing
-                        ? 'bg-lime-400 text-neutral-950 border-lime-400'
-                        : 'bg-neutral-800 hover:bg-neutral-700 text-neutral-200 border-neutral-700'
-                    }`}
-                    title="Preview Windows Offline Voice"
-                  >
-                    {isPreviewing ? <Square className="w-3.5 h-3.5 fill-neutral-950" /> : <Play className="w-3.5 h-3.5" />}
-                  </button>
-                </div>
-                <p className="text-[10px] text-neutral-500">
-                  Plays 100% offline using your Windows desktop speech engine without cloud queries.
-                </p>
+              <div className="px-3 py-2.5 rounded-xl bg-neutral-950 border border-neutral-800 text-[11px] text-neutral-500 leading-relaxed">
+                With <strong className="text-neutral-300">Local Models</strong> selected, Narrativ synthesizes directly
+                against a TTS engine running on <em>your</em> machine (Fish Audio, Orpheus, Piper…) — click
+                &ldquo;Model Hub &amp; GPU Setup&rdquo; to install one. If none are detected, generation falls back to
+                the cloud engine automatically (respecting your privacy mode).
               </div>
             )}
 
@@ -1364,6 +1610,12 @@ export const AudiobookCreatorView: React.FC<AudiobookCreatorViewProps> = ({
           <MultiVoiceCastingCard
             config={multiVoiceConfig}
             onChange={handleMultiVoiceChange}
+          />
+
+          {/* Per-Project Pronunciation Dictionary */}
+          <PronunciationDictionaryCard
+            entries={pronunciations}
+            onChange={handlePronunciationChange}
           />
 
           {/* Ambient Soundscapes & Procedural Foley Bed */}

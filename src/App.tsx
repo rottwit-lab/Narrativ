@@ -8,7 +8,8 @@ import { LocalModelInstallerModal } from './components/LocalModelInstallerModal'
 import { WindowsAppGuideModal } from './components/WindowsAppGuideModal';
 import { ExportMp3Modal } from './components/ExportMp3Modal';
 import { AudiobookProject, LocalLLMConfig } from './types';
-import { getAllProjectsOffline, getAudioBlobOffline, saveProjectOffline } from './utils/storage';
+import { getAllProjectsOffline, getAudioBlobOffline, saveProjectOffline, clearDraftOffline } from './utils/storage';
+import { probeLocalLLM } from './utils/localEngineProbe';
 import { DEFAULT_TTS_CONFIGS, detectGpuHardware } from './utils/hardwareDetector';
 
 export default function App() {
@@ -57,34 +58,32 @@ export default function App() {
     };
   });
 
-  // Check local engine status on startup (Ollama / LM Studio)
+  // Check local engine status on startup — probed from the BROWSER so it
+  // reaches the visitor's own machine, not the hosting server.
   const checkLocalEngines = async () => {
     try {
-      const res = await fetch('/api/privacy-status');
-      if (res.ok) {
-        const data = await res.json();
-        if (data.hasLocalLLM) {
-          // Probe tags to populate models
-          const testRes = await fetch('/api/local-llm/test-connection', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              endpoint: data.ollamaOnline ? 'http://localhost:11434' : 'http://localhost:1234',
-              provider: data.ollamaOnline ? 'ollama' : 'openai_compatible',
-            }),
-          });
-          const testData = await testRes.json();
-          if (testData.online) {
-            setLocalLLMConfig((prev) => ({
-              ...prev,
-              isConnected: true,
-              provider: testData.provider,
-              endpoint: data.ollamaOnline ? 'http://localhost:11434' : 'http://localhost:1234',
-              availableModels: testData.models || [],
-              selectedModel: testData.models?.[0] || prev.selectedModel,
-            }));
-          }
-        }
+      const result = await probeLocalLLM('http://localhost:11434', 'ollama');
+      if (result.online) {
+        setLocalLLMConfig((prev) => ({
+          ...prev,
+          isConnected: true,
+          provider: 'ollama',
+          endpoint: 'http://localhost:11434',
+          availableModels: result.models || [],
+          selectedModel: result.models?.[0] || prev.selectedModel,
+        }));
+        return;
+      }
+      const openaiResult = await probeLocalLLM('http://localhost:1234', 'openai_compatible');
+      if (openaiResult.online) {
+        setLocalLLMConfig((prev) => ({
+          ...prev,
+          isConnected: true,
+          provider: 'openai_compatible',
+          endpoint: 'http://localhost:1234',
+          availableModels: openaiResult.models || [],
+          selectedModel: openaiResult.models?.[0] || prev.selectedModel,
+        }));
       }
     } catch (e) {
       console.warn('Auto-discovery of local LLM skipped:', e);
@@ -147,6 +146,7 @@ export default function App() {
     setCurrentProject(null);
     setCurrentChapterIndex(0);
     setActiveView('create');
+    clearDraftOffline().catch(() => {});
   };
 
   const handleChapterChange = (index: number) => {
