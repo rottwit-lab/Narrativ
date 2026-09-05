@@ -1,0 +1,7 @@
+{
+  "name": "Narrativ",
+  "description": "Privacy-first AI audiobook studio with local LLM scriptwriting, offline neural voices, and seamless cloud TTS fallback if local models are unavailable.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
+

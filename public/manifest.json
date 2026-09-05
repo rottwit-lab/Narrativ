@@ -1,0 +1,44 @@
+{
+  "id": "/",
+  "name": "Narrativ - Windows AI Audiobook Studio",
+  "short_name": "Narrativ",
+  "description": "Create natural-sounding audiobooks from text files with emotion control, offline listening, and custom local LLM narration scripts.",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "display_override": ["window-controls-overlay", "standalone"],
+  "orientation": "any",
+  "background_color": "#0a0a0a",
+  "theme_color": "#0a0a0a",
+  "categories": ["books", "entertainment", "productivity", "utilities"],
+  "icons": [
+    {
+      "src": "/narrativ-logo.jpg",
+      "sizes": "192x192",
+      "type": "image/jpeg",
+      "purpose": "any"
+    },
+    {
+      "src": "/narrativ-logo.jpg",
+      "sizes": "512x512",
+      "type": "image/jpeg",
+      "purpose": "any"
+    }
+  ],
+  "shortcuts": [
+    {
+      "name": "New Audiobook",
+      "short_name": "New Book",
+      "description": "Upload a text file and generate an audiobook",
+      "url": "/?action=new",
+      "icons": [{ "src": "/narrativ-logo.jpg", "sizes": "192x192" }]
+    },
+    {
+      "name": "Offline Library",
+      "short_name": "Library",
+      "description": "Listen to your saved audiobooks offline",
+      "url": "/?view=library",
+      "icons": [{ "src": "/narrativ-logo.jpg", "sizes": "192x192" }]
+    }
+  ]
+}
